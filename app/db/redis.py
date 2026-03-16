@@ -7,6 +7,7 @@ redis_pool = aioredis.ConnectionPool.from_url(
     encoding="utf-8",
     decode_responses=True,
     max_connections=20,
+    ssl_cert_reqs=None,  
 )
 
 
