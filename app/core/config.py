@@ -1,6 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from typing import List
-import os
 
 
 class Settings(BaseSettings):
@@ -21,27 +21,36 @@ class Settings(BaseSettings):
 
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
-    
 
     allowed_origins: List[str] = [
         "http://localhost:3000",
         "http://localhost:8081",
         "http://localhost:5173",
     ]
-    
+
     guest_session_expire_hours: int = 24
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        
-        if self.is_production:
-            if "https://country-guessing-game.vercel.app" not in self.allowed_origins:
-                self.allowed_origins.append("https://country-guessing-game.vercel.app")
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def parse_allowed_origins(cls, v):
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            # Handle JSON array format: ["url1","url2"]
+            if v.startswith("["):
+                import json
+                try:
+                    return json.loads(v)
+                except Exception:
+                    pass
+            # Handle comma-separated format: url1,url2
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
 
     @property
     def is_production(self) -> bool:
-
-        return os.getenv("RENDER", False) or self.app_env == "production"
+        return self.app_env == "production"
 
 
 settings = Settings()
