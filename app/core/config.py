@@ -1,5 +1,4 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
 from typing import List
 
 
@@ -22,31 +21,22 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
 
-    allowed_origins: List[str] = [
-        "http://localhost:3000",
-        "http://localhost:8081",
-        "http://localhost:5173",
-    ]
+    # Keep as str — we parse it manually via property below
+    # This bypasses pydantic-settings trying to JSON-decode it automatically
+    allowed_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:5173"
 
     guest_session_expire_hours: int = 24
 
-    @field_validator("allowed_origins", mode="before")
-    @classmethod
-    def parse_allowed_origins(cls, v):
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            v = v.strip()
-            # Handle JSON array format: ["url1","url2"]
-            if v.startswith("["):
-                import json
-                try:
-                    return json.loads(v)
-                except Exception:
-                    pass
-            # Handle comma-separated format: url1,url2
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+    @property
+    def allowed_origins_list(self) -> List[str]:
+        v = self.allowed_origins.strip()
+        if v.startswith("["):
+            import json
+            try:
+                return json.loads(v)
+            except Exception:
+                pass
+        return [origin.strip() for origin in v.split(",") if origin.strip()]
 
     @property
     def is_production(self) -> bool:
