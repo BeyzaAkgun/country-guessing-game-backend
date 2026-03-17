@@ -1,4 +1,3 @@
-#main.py
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,14 +12,15 @@ import app.models  # noqa
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Redis
     redis = get_redis()
     await redis.ping()
     print("✅ Redis connected")
 
-    if settings.debug:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        print("✅ Database tables ready")
+    # Database — always create tables if they don't exist
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    print("✅ Database tables ready")
 
     yield
 
@@ -48,7 +48,7 @@ app.add_middleware(
 # REST API routes
 app.include_router(api_router)
 
-# WebSocket routes — registered directly on app, not under /api/v1
+# WebSocket routes
 app.include_router(ws_router)
 
 
