@@ -2,12 +2,21 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 from app.core.config import settings
 
+# Remove ?ssl=require from URL if present — we pass ssl as a connect_arg instead
+database_url = settings.database_url.replace("?ssl=require", "").replace("&ssl=require", "")
+
+# SSL connect args for Supabase / production
+connect_args = {}
+if "supabase.co" in database_url or settings.is_production:
+    connect_args["ssl"] = "require"
+
 engine = create_async_engine(
-    settings.database_url,
+    database_url,
     echo=settings.debug,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=5,
+    max_overflow=10,
+    connect_args=connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
