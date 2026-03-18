@@ -18,6 +18,8 @@ engine = create_async_engine(
     pool_size=5,
     max_overflow=10,
     connect_args=connect_args,
+    # Also disable at engine level to cover all session types
+    execution_options={"compiled_cache": None},
 )
 
 AsyncSessionLocal = async_sessionmaker(
