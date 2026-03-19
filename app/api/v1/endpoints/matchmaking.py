@@ -17,7 +17,7 @@ from app.models.match import MatchQuestion
 router = APIRouter(prefix="/matchmaking", tags=["matchmaking"])
 
 MATCH_QUEUE_KEY = "matchmaking:queue"
-QUEUE_TTL = 300  # 5 minutes — long enough for slow matchmaking
+QUEUE_TTL = 300  # 5 minutes
 
 
 @router.post("/queue", response_model=dict)
@@ -34,8 +34,14 @@ async def join_queue(
 
     user_id = str(current_user.id)
 
-    # Clear any stale match_found key from a previous session
-    await redis.delete(f"queue:match_found:{user_id}")
+    # ── Check if a match was already created for this player ─────────────────
+    # This happens when the opponent joined first and already ran _try_match
+    existing_match = await redis.get(f"queue:match_found:{user_id}")
+    if existing_match:
+        return {
+            "status": "match_found",
+            "match_id": existing_match,
+        }
 
     # Check if already in queue — remove and re-add to refresh TTL
     await redis.zrem(MATCH_QUEUE_KEY, user_id)
@@ -64,7 +70,7 @@ async def leave_queue(
     await redis.zrem(MATCH_QUEUE_KEY, user_id)
     await redis.delete(f"queue:mode:{user_id}")
     await redis.delete(f"queue:joined:{user_id}")
-    await redis.delete(f"queue:match_found:{user_id}")  # clear stale match_found
+    await redis.delete(f"queue:match_found:{user_id}")
     return {"status": "left_queue"}
 
 
@@ -75,7 +81,6 @@ async def queue_status(
 ):
     user_id = str(current_user.id)
 
-    # Check if a match was found
     match_id = await redis.get(f"queue:match_found:{user_id}")
     if match_id:
         await redis.delete(f"queue:match_found:{user_id}")
@@ -102,7 +107,7 @@ async def _try_match(
     question_mode: QuestionMode,
     db: AsyncSession,
     redis: aioredis.Redis,
-    rank_range: int = 1000,  # wide range ensures players always find each other
+    rank_range: int = 1000,
 ) -> Match | None:
     min_score = max(0, rank_points - rank_range)
     max_score = rank_points + rank_range
@@ -118,7 +123,6 @@ async def _try_match(
             continue
         candidate_mode = await redis.get(f"queue:mode:{candidate_str}")
         if not candidate_mode:
-            # Key expired but player still in sorted set — treat as classic rather than skip
             candidate_mode_str = "classic"
         else:
             candidate_mode_str = candidate_mode.decode() if isinstance(candidate_mode, bytes) else candidate_mode
@@ -133,11 +137,10 @@ async def _try_match(
 
     print(f"DEBUG: matched {user_id} vs {opponent_id}")
 
-    # Atomic lock: only one of the two simultaneous _try_match calls creates the match
     match_lock_key = f"queue:match_lock:{min(user_id, opponent_id)}:{max(user_id, opponent_id)}"
     locked = await redis.set(match_lock_key, "1", nx=True, ex=10)
     if not locked:
-        return None  # other side already creating this match
+        return None
 
     pipe = redis.pipeline()
     pipe.zrem(MATCH_QUEUE_KEY, user_id)
@@ -202,7 +205,6 @@ async def forfeit_match(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """Explicit forfeit — called when player clicks 'Abandon match' on reconnect screen."""
     from uuid import UUID
     from datetime import datetime, timezone
     from app.models.match import MatchStatus
@@ -211,12 +213,10 @@ async def forfeit_match(
 
     user_id = str(current_user.id)
 
-    # Guard: match must still be active
     state = await redis.hgetall(f"match:state:{match_id}")
     if not state or state.get("status") != "in_progress":
         return {"status": "already_finished"}
 
-    # Cancel any pending grace-period forfeit for this player
     await redis.set(f"match:grace:{match_id}:{user_id}", "cancelled", ex=60)
 
     now = datetime.now(timezone.utc)
@@ -236,14 +236,12 @@ async def forfeit_match(
 
     if winner:
         await _handle_win_loss(match_id, winner, loser, now, db, redis)
-        # Mark as forfeit in the stored result
         stored = await redis.get(f"match:result:{match_id}")
         if stored:
             payload = json.loads(stored)
             payload["forfeit"] = True
             await redis.set(f"match:result:{match_id}", json.dumps(payload), ex=300)
     else:
-        # No opponent found — just close the match cleanly
         match_res = (await db.execute(
             select(Match).where(Match.id == UUID(match_id))
         )).scalar_one_or_none()
@@ -253,7 +251,6 @@ async def forfeit_match(
             await db.commit()
         await redis.hset(f"match:state:{match_id}", "status", MatchStatus.FINISHED.value)
 
-    # Return the actual XP/RP values so the frontend can sync localStorage
     return {
         "status": "forfeited",
         "xp_earned": loser.xp_earned,
