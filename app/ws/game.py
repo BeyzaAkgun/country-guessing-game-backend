@@ -263,6 +263,9 @@ async def _start_match(match_id: str, db: AsyncSession, redis):
         "started_at": now.isoformat(),
     })
 
+    # Start auto-advance timer for round 1
+    asyncio.create_task(_auto_advance(match_id, 1, now.isoformat(), redis))
+
 
 async def _handle_answer(
     websocket: WebSocket,
@@ -418,10 +421,39 @@ async def _advance_round(match_id, current_round, total_rounds, redis):
                 "started_at": now.isoformat(),
             })
 
+            # Start auto-advance timer for next round
+            asyncio.create_task(_auto_advance(match_id, next_round, now.isoformat(), redis))
+
         except Exception as e:
             logger.error(f"_advance_round error match={match_id} round={current_round}: {e}", exc_info=True)
             await db.rollback()
 
+
+
+
+async def _auto_advance(match_id: str, round_num: int, started_at: str, redis):
+    """Auto-advance the round after ROUND_SECONDS if nobody answered correctly."""
+    ROUND_SECONDS = 30
+    try:
+        elapsed = (datetime.now(timezone.utc).timestamp() -
+                   datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp())
+        wait = max(0, ROUND_SECONDS - elapsed)
+        await asyncio.sleep(wait + 0.5)  # small buffer
+
+        # Check if round already advanced
+        state = await redis.hgetall(RedisKeys.match_state(match_id))
+        if not state:
+            return
+        if int(state.get("current_round", 0)) != round_num:
+            return  # already advanced by a correct answer
+        if state.get("status") != "in_progress":
+            return
+
+        total_rounds = int(state.get("total_rounds", "10"))
+        logger.info(f"Auto-advancing match {match_id} round {round_num} (timer expired)")
+        await _advance_round(match_id, round_num, total_rounds, redis)
+    except Exception as e:
+        logger.error(f"_auto_advance error match={match_id} round={round_num}: {e}", exc_info=True)
 
 async def _finish_match(match_id, db, redis):
     import asyncio
