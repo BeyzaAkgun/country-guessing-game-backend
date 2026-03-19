@@ -1,6 +1,6 @@
 from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, insert
+from sqlalchemy import select
 import json
 import logging
 import asyncio
@@ -40,32 +40,25 @@ async def handle_game_connection(
         await manager.broadcast(match_id, "player_connected", {"user_id": user_id})
 
         conn_count = manager.get_connection_count(match_id)
-        # Re-read status from Redis fresh (state was fetched before connect())
         fresh_state = await redis.hgetall(RedisKeys.match_state(match_id))
         match_status = fresh_state.get("status", "")
 
         logger.info(f"Player {user_id} connected to match {match_id} | status={match_status} | conn_count={conn_count}")
 
         if match_status == MatchStatus.FINISHED.value:
-            # ── Match already over: send result immediately ──────────────────
-            await _send_resync(websocket, match_id, redis)  # handles FINISHED internally
+            await _send_resync(websocket, match_id, redis)
 
         elif match_status == MatchStatus.IN_PROGRESS.value:
-            # ── RECONNECT: match is already running ──────────────────────────
             grace_key = f"match:grace:{match_id}:{user_id}"
             existing = await redis.get(grace_key)
             if existing == "waiting":
-                await redis.set(grace_key, "cancelled", ex=60)  # must outlive the 15s sleep
+                await redis.set(grace_key, "cancelled", ex=60)
                 logger.info(f"Forfeit grace cancelled for {user_id} in {match_id}")
 
-            # Tell the other player their opponent is back
             await manager.broadcast_except(match_id, websocket, "opponent_reconnected", {"user_id": user_id})
-
-            # Send full game state to the reconnecting player only
             await _send_resync(websocket, match_id, redis)
 
         else:
-            # ── FRESH MATCH: wait for both players then start ────────────────
             if conn_count == 2:
                 lock_key = f"match:start_lock:{match_id}"
                 locked = await redis.set(lock_key, "1", nx=True, ex=30)
@@ -84,50 +77,41 @@ async def handle_game_connection(
             data = message.get("data", {})
 
             if event == "answer":
-                await _handle_answer(websocket, match_id, user_id, data, db, redis)
+                await _handle_answer(websocket, match_id, user_id, data, redis)
             elif event == "ping":
                 await manager.send_to(websocket, "pong", {})
 
     except WebSocketDisconnect:
         manager.disconnect(match_id, websocket)
 
-        # ── Record abandon for future analytics ──────────────────────────────
         from uuid import UUID
         try:
-            result = await db.execute(
-                select(MatchPlayer).where(
-                    MatchPlayer.match_id == UUID(match_id),
-                    MatchPlayer.user_id == UUID(user_id),
+            async with AsyncSessionLocal() as disc_db:
+                result = await disc_db.execute(
+                    select(MatchPlayer).where(
+                        MatchPlayer.match_id == UUID(match_id),
+                        MatchPlayer.user_id == UUID(user_id),
+                    )
                 )
-            )
-            player = result.scalar_one_or_none()
-            if player:
-                player.disconnected = True
-                await db.commit()
+                player = result.scalar_one_or_none()
+                if player:
+                    player.disconnected = True
+                    await disc_db.commit()
         except Exception as e:
             logger.error(f"Error marking disconnected: {e}")
 
-        # ── Notify remaining player and start 15s forfeit grace window ───────
         state = await redis.hgetall(RedisKeys.match_state(match_id))
         match_still_active = state.get("status") == "in_progress"
 
         if match_still_active:
-            # Tell the remaining player their opponent disconnected
             await manager.broadcast(match_id, "player_disconnected", {
                 "user_id": user_id,
                 "grace_seconds": 15,
             })
-
-            # Set a Redis flag so reconnect can cancel the forfeit
             grace_key = f"match:grace:{match_id}:{user_id}"
             await redis.set(grace_key, "waiting", ex=20)
-
-            # Fire-and-forget forfeit task
-            asyncio.create_task(
-                _forfeit_after_grace(match_id, user_id, 15, redis)
-            )
+            asyncio.create_task(_forfeit_after_grace(match_id, user_id, 15, redis))
         else:
-            # Match already finished — just notify cleanly
             await manager.broadcast(match_id, "player_disconnected", {
                 "user_id": user_id,
                 "grace_seconds": 0,
@@ -138,28 +122,22 @@ async def handle_game_connection(
         manager.disconnect(match_id, websocket)
 
 
-
 async def _forfeit_after_grace(match_id: str, disconnected_user_id: str, grace_seconds: int, redis):
-    """Wait grace_seconds; if player hasn't reconnected, declare forfeit win for the other player.
-    Opens its own DB session — the original request session is closed by the time we wake up."""
     await asyncio.sleep(grace_seconds)
 
     grace_key = f"match:grace:{match_id}:{disconnected_user_id}"
     status = await redis.get(grace_key)
 
     if status == "cancelled":
-        # Player reconnected in time — nothing to do
         logger.info(f"Forfeit cancelled for {disconnected_user_id} in match {match_id}")
         return
 
-    # Also check live connection count — if player is back, abort forfeit
     conn_count = manager.get_connection_count(match_id)
     if conn_count >= 2:
         logger.info(f"Forfeit aborted — {conn_count} players connected in match {match_id}")
         await redis.delete(grace_key)
         return
 
-    # Check match is still active
     state = await redis.hgetall(RedisKeys.match_state(match_id))
     if state.get("status") != "in_progress":
         return
@@ -169,7 +147,6 @@ async def _forfeit_after_grace(match_id: str, disconnected_user_id: str, grace_s
     from uuid import UUID
     now = datetime.now(timezone.utc)
 
-    # Open a fresh session — the original request session is long closed
     async with AsyncSessionLocal() as db:
         try:
             result = await db.execute(
@@ -183,27 +160,13 @@ async def _forfeit_after_grace(match_id: str, disconnected_user_id: str, grace_s
             loser  = next((p for p in players if str(p.user_id) == disconnected_user_id), None)
 
             if winner and loser:
+                await _sync_wrong_answers(match_id, [winner, loser], redis)
                 await _handle_win_loss(match_id, winner, loser, now, db, redis)
                 stored = await redis.get(f"match:result:{match_id}")
                 if stored:
                     payload = json.loads(stored)
                     payload["forfeit"] = True
                     await redis.set(f"match:result:{match_id}", json.dumps(payload), ex=300)
-            elif winner:
-                await manager.broadcast(match_id, "match_end", {
-                    "winner_id": str(winner.user_id),
-                    "is_draw": False,
-                    "forfeit": True,
-                    "players": [{
-                        "user_id": str(winner.user_id),
-                        "score": winner.score,
-                        "correct_answers": winner.correct_answers,
-                        "wrong_answers": winner.wrong_answers,
-                        "best_streak": winner.best_streak,
-                        "xp_earned": 0,
-                        "rank_points_delta": 0,
-                    }],
-                })
             await db.commit()
         except Exception as e:
             logger.error(f"Forfeit DB error for match {match_id}: {e}", exc_info=True)
@@ -212,24 +175,18 @@ async def _forfeit_after_grace(match_id: str, disconnected_user_id: str, grace_s
     await redis.delete(grace_key)
 
 
-
 async def _send_resync(websocket, match_id: str, redis):
-    """Send game state to a reconnecting player. If match is finished, send result instead."""
     state = await redis.hgetall(RedisKeys.match_state(match_id))
     match_status = state.get("status", "")
 
-    # ── Match already finished: send stored result so player sees defeat screen ─
     if match_status == MatchStatus.FINISHED.value:
         stored = await redis.get(f"match:result:{match_id}")
         if stored:
             await manager.send_to(websocket, "match_end", json.loads(stored))
-            logger.info(f"Sent stored result to late-reconnecting player in finished match {match_id}")
         else:
-            # Result not in Redis anymore — send a generic finished error
             await manager.send_to(websocket, "error", {"message": "This match has already ended."})
         return
 
-    # ── Match still in progress: resync to current round ─────────────────────
     current_round = int(state.get("current_round", "1"))
 
     questions_raw = await redis.get(f"match:questions:{match_id}")
@@ -255,7 +212,6 @@ async def _send_resync(websocket, match_id: str, redis):
         "mode": current_q.get("question_mode", "classic"),
         "started_at": asked_at,
     })
-    logger.info(f"Resynced match {match_id} round {current_round} to reconnecting player")
 
 
 async def _start_match(match_id: str, db: AsyncSession, redis):
@@ -313,9 +269,12 @@ async def _handle_answer(
     match_id: str,
     user_id: str,
     data: dict,
-    db: AsyncSession,
     redis,
 ):
+    """
+    Handle a player's answer. Uses its own fresh DB session for each call
+    to avoid session corruption from multiple rapid wrong-answer submissions.
+    """
     from uuid import UUID
 
     raw_answer = data.get("answer", "").strip()
@@ -325,11 +284,11 @@ async def _handle_answer(
     current_round = int(state.get("current_round", "1"))
     total_rounds = int(state.get("total_rounds", "10"))
 
-    # Check if player already answered CORRECTLY this round — block only then
+    # Block if player already answered correctly this round
     correct_key = f"match:player_correct:{match_id}:{current_round}:{user_id}"
     already_correct = await redis.exists(correct_key)
     if already_correct:
-        return  # Already got it right, ignore further submissions
+        return
 
     questions_raw = await redis.get(f"match:questions:{match_id}")
     if not questions_raw:
@@ -339,43 +298,46 @@ async def _handle_answer(
     if not current_q:
         return
 
-    # Case-insensitive comparison
     correct = bool(raw_answer) and raw_answer.lower() == current_q["country_name"].lower()
-
-    # If correct, mark so player can't submit again this round
-    if correct:
-        await redis.setex(correct_key, 300, "1")
-
-    result = await db.execute(
-        select(MatchPlayer).where(
-            MatchPlayer.match_id == UUID(match_id),
-            MatchPlayer.user_id == UUID(user_id),
-        )
-    )
-    player = result.scalar_one_or_none()
-    if not player:
-        return
 
     streak = 0
     points = 0
 
     if correct:
-        player.correct_answers += 1
-        streak_key = f"match:streak:{match_id}:{user_id}"
-        streak = int(await redis.get(streak_key) or "0") + 1
-        await redis.setex(streak_key, 3600, str(streak))
-        multiplier = 2.0 if streak >= 5 else 1.5 if streak >= 3 else 1.0
-        # Reduce points by 15% per extra hint used (first hint is free)
-        hint_penalty = max(0, hints_used - 1) * 0.15
-        points = int(100 * multiplier * max(0.25, 1.0 - hint_penalty))
-        player.score += points
-        player.best_streak = max(player.best_streak, streak)
+        # Mark correct immediately in Redis to prevent duplicate correct submissions
+        await redis.setex(correct_key, 300, "1")
+
+        # Fresh DB session for correct answer — isolated, won't be dirtied by wrong answers
+        async with AsyncSessionLocal() as db:
+            try:
+                result = await db.execute(
+                    select(MatchPlayer).where(
+                        MatchPlayer.match_id == UUID(match_id),
+                        MatchPlayer.user_id == UUID(user_id),
+                    )
+                )
+                player = result.scalar_one_or_none()
+                if player:
+                    player.correct_answers += 1
+                    streak_key = f"match:streak:{match_id}:{user_id}"
+                    streak = int(await redis.get(streak_key) or "0") + 1
+                    await redis.setex(streak_key, 3600, str(streak))
+                    multiplier = 2.0 if streak >= 5 else 1.5 if streak >= 3 else 1.0
+                    hint_penalty = max(0, hints_used - 1) * 0.15
+                    points = int(100 * multiplier * max(0.25, 1.0 - hint_penalty))
+                    player.score += points
+                    player.best_streak = max(player.best_streak, streak)
+                    await db.commit()
+            except Exception as e:
+                logger.error(f"DB error on correct answer {match_id}/{user_id}: {e}", exc_info=True)
+                await db.rollback()
     else:
-        player.wrong_answers += 1
+        # Wrong answer — Redis only, no DB write
+        await redis.incr(f"match:wrong:{match_id}:{user_id}")
+        await redis.expire(f"match:wrong:{match_id}:{user_id}", 3600)
         await redis.delete(f"match:streak:{match_id}:{user_id}")
 
-    await db.commit()
-
+    # Send result to this player
     await manager.send_to(websocket, "answer_result", {
         "correct": correct,
         "points_earned": points,
@@ -384,6 +346,7 @@ async def _handle_answer(
         "round": current_round,
     })
 
+    # Broadcast to both players
     await manager.broadcast(match_id, "player_answered", {
         "user_id": user_id,
         "correct": correct,
@@ -391,20 +354,16 @@ async def _handle_answer(
         "round": current_round,
     })
 
-    # Track correct answers this round
+    # Advance round on correct answer
     if correct:
-        answered_key = f"match:answered:{match_id}:{current_round}"
-        await redis.sadd(answered_key, user_id)
-        await redis.expire(answered_key, 3600)
-        answered_count = await redis.scard(answered_key)
-        # Advance immediately on first correct answer
-        # (both players can still answer after this until round ends)
-        await _advance_round(match_id, current_round, total_rounds, db, redis)
+        asyncio.create_task(_advance_round(match_id, current_round, total_rounds, redis))
 
 
-async def _advance_round(match_id, current_round, total_rounds, db, redis):
-    from uuid import UUID
-
+async def _advance_round(match_id, current_round, total_rounds, redis):
+    """
+    Advance to next round. Always uses a fresh DB session.
+    Called as a background task to avoid blocking the WebSocket handler.
+    """
     lock_key = f"match:round_lock:{match_id}:{current_round}"
     locked = await redis.set(lock_key, "1", nx=True, ex=10)
     if not locked:
@@ -412,47 +371,56 @@ async def _advance_round(match_id, current_round, total_rounds, db, redis):
 
     now = datetime.now(timezone.utc)
 
-    result = await db.execute(
-        select(MatchQuestion).where(
-            MatchQuestion.match_id == UUID(match_id),
-            MatchQuestion.round_number == current_round,
-        )
-    )
-    mq = result.scalar_one_or_none()
-    if mq and not mq.answered_at:
-        mq.answered_at = now
-        await db.commit()
+    async with AsyncSessionLocal() as db:
+        try:
+            from uuid import UUID
 
-    next_round = current_round + 1
-    if next_round > total_rounds:
-        await _finish_match(match_id, db, redis)
-        return
+            result = await db.execute(
+                select(MatchQuestion).where(
+                    MatchQuestion.match_id == UUID(match_id),
+                    MatchQuestion.round_number == current_round,
+                )
+            )
+            mq = result.scalar_one_or_none()
+            if mq and not mq.answered_at:
+                mq.answered_at = now
+                await db.commit()
 
-    await redis.hset(RedisKeys.match_state(match_id), "current_round", str(next_round))
+            next_round = current_round + 1
+            if next_round > total_rounds:
+                await _finish_match(match_id, db, redis)
+                return
 
-    questions_raw = await redis.get(f"match:questions:{match_id}")
-    questions = json.loads(questions_raw)
-    next_q = next((q for q in questions if q["round_number"] == next_round), None)
-    if not next_q:
-        return
+            await redis.hset(RedisKeys.match_state(match_id), "current_round", str(next_round))
+            await redis.hset(RedisKeys.match_state(match_id), f"round_{next_round}_started_at", now.isoformat())
 
-    result = await db.execute(
-        select(MatchQuestion).where(
-            MatchQuestion.match_id == UUID(match_id),
-            MatchQuestion.round_number == next_round,
-        )
-    )
-    mq = result.scalar_one_or_none()
-    if mq and not mq.asked_at:
-        mq.asked_at = now
-        await db.commit()
+            questions_raw = await redis.get(f"match:questions:{match_id}")
+            questions = json.loads(questions_raw)
+            next_q = next((q for q in questions if q["round_number"] == next_round), None)
+            if not next_q:
+                return
 
-    await manager.broadcast(match_id, "question", {
-        "round": next_q["round_number"],
-        "country_name": next_q["country_name"],
-        "mode": next_q["question_mode"],
-        "started_at": now.isoformat(),
-    })
+            result = await db.execute(
+                select(MatchQuestion).where(
+                    MatchQuestion.match_id == UUID(match_id),
+                    MatchQuestion.round_number == next_round,
+                )
+            )
+            mq = result.scalar_one_or_none()
+            if mq and not mq.asked_at:
+                mq.asked_at = now
+                await db.commit()
+
+            await manager.broadcast(match_id, "question", {
+                "round": next_q["round_number"],
+                "country_name": next_q["country_name"],
+                "mode": next_q["question_mode"],
+                "started_at": now.isoformat(),
+            })
+
+        except Exception as e:
+            logger.error(f"_advance_round error match={match_id} round={current_round}: {e}", exc_info=True)
+            await db.rollback()
 
 
 async def _finish_match(match_id, db, redis):
@@ -472,14 +440,12 @@ async def _finish_match(match_id, db, redis):
     )
     players = result.scalars().all()
     if not players:
-        # No player rows at all - still broadcast end to unblock clients
         await manager.broadcast(match_id, "match_end", {
             "winner_id": None, "is_draw": True, "players": []
         })
         return
 
     if len(players) < 2:
-        # Only one player found (other disconnected) - they win by default
         solo = players[0]
         await manager.broadcast(match_id, "match_end", {
             "winner_id": str(solo.user_id),
@@ -496,6 +462,9 @@ async def _finish_match(match_id, db, redis):
         })
         return
 
+    # Sync wrong_answers from Redis before computing results
+    await _sync_wrong_answers(match_id, players, redis)
+
     p0, p1 = players[0], players[1]
     is_draw = p0.correct_answers == p1.correct_answers
 
@@ -510,6 +479,15 @@ async def _finish_match(match_id, db, redis):
         await _handle_win_loss(match_id, sorted_players[0], sorted_players[-1], now, db, redis)
 
 
+async def _sync_wrong_answers(match_id: str, players, redis):
+    """Sync wrong_answers count from Redis into MatchPlayer objects before DB write."""
+    for player in players:
+        uid = str(player.user_id)
+        wrong_raw = await redis.get(f"match:wrong:{match_id}:{uid}")
+        if wrong_raw:
+            player.wrong_answers = int(wrong_raw)
+
+
 async def _handle_draw(match_id, p0, p1, now, db, redis):
     from uuid import UUID
 
@@ -520,7 +498,6 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
         for player, profile in [(p0, wp0), (p1, wp1)]:
             base_xp = calculate_xp_gain(True, player.correct_answers, player.best_streak)
             draw_xp = max(1, int(base_xp * DRAW_XP_MULTIPLIER))
-
             profile.xp += draw_xp
             profile.total_matches += 1
             profile.total_correct += player.correct_answers
@@ -528,7 +505,6 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
             profile.best_streak = max(profile.best_streak, player.best_streak)
             profile.rank_points = max(0, profile.rank_points + DRAW_RP_BONUS)
             profile.rank_tier = calculate_rank_tier(profile.rank_points)
-
             player.xp_earned = draw_xp
             player.rank_points_delta = DRAW_RP_BONUS
 
@@ -573,7 +549,6 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
 async def _handle_win_loss(match_id, winner, loser, now, db, redis):
     from uuid import UUID
 
-    # expire_all forces SQLAlchemy to re-fetch from DB, bypassing the identity map cache
     db.expire_all()
     wp = (await db.execute(select(Profile).where(Profile.user_id == winner.user_id))).scalar_one_or_none()
     lp = (await db.execute(select(Profile).where(Profile.user_id == loser.user_id))).scalar_one_or_none()
@@ -630,7 +605,6 @@ async def _handle_win_loss(match_id, winner, loser, now, db, redis):
     if lp:
         await redis.zadd("leaderboard:global", {str(loser.user_id): lp.rank_points})
 
-    # Use in-memory values for payload — avoids stale re-fetch after commit
     match_end_payload = {
         "winner_id": str(winner.user_id),
         "is_draw": False,
@@ -656,7 +630,6 @@ async def _handle_win_loss(match_id, winner, loser, now, db, redis):
             },
         ],
     }
-    # Store for late-reconnecting players (TTL 5 min)
     await redis.set(f"match:result:{match_id}", json.dumps(match_end_payload), ex=300)
     await manager.broadcast(match_id, "match_end", match_end_payload)
 
