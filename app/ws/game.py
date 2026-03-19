@@ -1,4 +1,3 @@
-#game.py
 from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, insert
@@ -326,10 +325,11 @@ async def _handle_answer(
     current_round = int(state.get("current_round", "1"))
     total_rounds = int(state.get("total_rounds", "10"))
 
-    already_key = f"match:player_answered:{match_id}:{current_round}:{user_id}"
-    acquired = await redis.set(already_key, "1", nx=True, ex=300)
-    if not acquired:
-        return
+    # Check if player already answered CORRECTLY this round — block only then
+    correct_key = f"match:player_correct:{match_id}:{current_round}:{user_id}"
+    already_correct = await redis.exists(correct_key)
+    if already_correct:
+        return  # Already got it right, ignore further submissions
 
     questions_raw = await redis.get(f"match:questions:{match_id}")
     if not questions_raw:
@@ -341,6 +341,10 @@ async def _handle_answer(
 
     # Case-insensitive comparison
     correct = bool(raw_answer) and raw_answer.lower() == current_q["country_name"].lower()
+
+    # If correct, mark so player can't submit again this round
+    if correct:
+        await redis.setex(correct_key, 300, "1")
 
     result = await db.execute(
         select(MatchPlayer).where(
@@ -387,13 +391,14 @@ async def _handle_answer(
         "round": current_round,
     })
 
-    answered_key = f"match:answered:{match_id}:{current_round}"
-    await redis.sadd(answered_key, user_id)
-    await redis.expire(answered_key, 3600)
-    answered_count = await redis.scard(answered_key)
-
-    # Race mode: advance immediately on correct, or when both answered
-    if correct or answered_count >= 2:
+    # Track correct answers this round
+    if correct:
+        answered_key = f"match:answered:{match_id}:{current_round}"
+        await redis.sadd(answered_key, user_id)
+        await redis.expire(answered_key, 3600)
+        answered_count = await redis.scard(answered_key)
+        # Advance immediately on first correct answer
+        # (both players can still answer after this until round ends)
         await _advance_round(match_id, current_round, total_rounds, db, redis)
 
 
@@ -568,6 +573,8 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
 async def _handle_win_loss(match_id, winner, loser, now, db, redis):
     from uuid import UUID
 
+    # expire_all forces SQLAlchemy to re-fetch from DB, bypassing the identity map cache
+    db.expire_all()
     wp = (await db.execute(select(Profile).where(Profile.user_id == winner.user_id))).scalar_one_or_none()
     lp = (await db.execute(select(Profile).where(Profile.user_id == loser.user_id))).scalar_one_or_none()
 
