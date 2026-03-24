@@ -526,22 +526,41 @@ async def _sync_wrong_answers(match_id: str, players, redis):
 async def _handle_draw(match_id, p0, p1, now, db, redis):
     from uuid import UUID
 
-    wp0 = (await db.execute(select(Profile).where(Profile.user_id == p0.user_id))).scalar_one_or_none()
-    wp1 = (await db.execute(select(Profile).where(Profile.user_id == p1.user_id))).scalar_one_or_none()
+    # Capture all values before async operations
+    p0_id      = p0.user_id
+    p0_correct = p0.correct_answers
+    p0_wrong   = p0.wrong_answers
+    p0_streak  = p0.best_streak
+    p0_score   = p0.score
+    p1_id      = p1.user_id
+    p1_correct = p1.correct_answers
+    p1_wrong   = p1.wrong_answers
+    p1_streak  = p1.best_streak
+    p1_score   = p1.score
+
+    wp0 = (await db.execute(select(Profile).where(Profile.user_id == p0_id))).scalar_one_or_none()
+    wp1 = (await db.execute(select(Profile).where(Profile.user_id == p1_id))).scalar_one_or_none()
+
+    p0_xp = p1_xp = 0
 
     if wp0 and wp1:
-        for player, profile in [(p0, wp0), (p1, wp1)]:
-            base_xp = calculate_xp_gain(True, player.correct_answers, player.best_streak)
+        for (pid, correct, wrong, streak, profile) in [
+            (p0_id, p0_correct, p0_wrong, p0_streak, wp0),
+            (p1_id, p1_correct, p1_wrong, p1_streak, wp1),
+        ]:
+            base_xp = calculate_xp_gain(True, correct, streak)
             draw_xp = max(1, int(base_xp * DRAW_XP_MULTIPLIER))
             profile.xp += draw_xp
             profile.total_matches += 1
-            profile.total_correct += player.correct_answers
-            profile.total_questions += player.correct_answers + player.wrong_answers
-            profile.best_streak = max(profile.best_streak, player.best_streak)
+            profile.total_correct += correct
+            profile.total_questions += correct + wrong
+            profile.best_streak = max(profile.best_streak, streak)
             profile.rank_points = max(0, profile.rank_points + DRAW_RP_BONUS)
             profile.rank_tier = calculate_rank_tier(profile.rank_points)
-            player.xp_earned = draw_xp
-            player.rank_points_delta = DRAW_RP_BONUS
+            if pid == p0_id:
+                p0_xp = draw_xp
+            else:
+                p1_xp = draw_xp
 
     match_res = (await db.execute(select(Match).where(Match.id == UUID(match_id)))).scalar_one_or_none()
     if match_res:
@@ -552,27 +571,32 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
     await db.commit()
 
     if wp0:
-        await redis.zadd("leaderboard:global", {str(p0.user_id): wp0.rank_points})
+        await redis.zadd("leaderboard:global", {str(p0_id): wp0.rank_points})
     if wp1:
-        await redis.zadd("leaderboard:global", {str(p1.user_id): wp1.rank_points})
-
-    result = await db.execute(select(MatchPlayer).where(MatchPlayer.match_id == UUID(match_id)))
-    players = result.scalars().all()
+        await redis.zadd("leaderboard:global", {str(p1_id): wp1.rank_points})
 
     await manager.broadcast(match_id, "match_end", {
         "winner_id": None,
         "is_draw": True,
         "players": [
             {
-                "user_id": str(p.user_id),
-                "score": p.score,
-                "correct_answers": p.correct_answers,
-                "wrong_answers": p.wrong_answers,
-                "best_streak": p.best_streak,
-                "xp_earned": p.xp_earned,
-                "rank_points_delta": p.rank_points_delta,
-            }
-            for p in players
+                "user_id": str(p0_id),
+                "score": p0_score,
+                "correct_answers": p0_correct,
+                "wrong_answers": p0_wrong,
+                "best_streak": p0_streak,
+                "xp_earned": p0_xp,
+                "rank_points_delta": DRAW_RP_BONUS,
+            },
+            {
+                "user_id": str(p1_id),
+                "score": p1_score,
+                "correct_answers": p1_correct,
+                "wrong_answers": p1_wrong,
+                "best_streak": p1_streak,
+                "xp_earned": p1_xp,
+                "rank_points_delta": DRAW_RP_BONUS,
+            },
         ],
     })
 
@@ -584,39 +608,48 @@ async def _handle_draw(match_id, p0, p1, now, db, redis):
 async def _handle_win_loss(match_id, winner, loser, now, db, redis):
     from uuid import UUID
 
-    db.expire_all()
-    wp = (await db.execute(select(Profile).where(Profile.user_id == winner.user_id))).scalar_one_or_none()
-    lp = (await db.execute(select(Profile).where(Profile.user_id == loser.user_id))).scalar_one_or_none()
+    # Capture all values from ORM objects BEFORE any async operations
+    # This prevents MissingGreenlet errors from lazy-loading on expired objects
+    winner_id             = winner.user_id
+    loser_id              = loser.user_id
+    winner_score          = winner.score
+    winner_correct        = winner.correct_answers
+    winner_wrong          = winner.wrong_answers
+    winner_streak         = winner.best_streak
+    loser_score           = loser.score
+    loser_correct         = loser.correct_answers
+    loser_wrong           = loser.wrong_answers
+    loser_streak          = loser.best_streak
+
+    wp = (await db.execute(select(Profile).where(Profile.user_id == winner_id))).scalar_one_or_none()
+    lp = (await db.execute(select(Profile).where(Profile.user_id == loser_id))).scalar_one_or_none()
 
     w_xp, l_xp, w_rp, l_rp = 0, 0, 0, 0
 
     if wp and lp:
-        w_xp = calculate_xp_gain(True, winner.correct_answers, winner.best_streak)
-        l_xp = calculate_xp_gain(False, loser.correct_answers, loser.best_streak)
+        w_xp = calculate_xp_gain(True, winner_correct, winner_streak)
+        l_xp = calculate_xp_gain(False, loser_correct, loser_streak)
         w_rp = calculate_rank_points_delta(True, lp.rank_points, wp.rank_points)
         l_rp = calculate_rank_points_delta(False, wp.rank_points, lp.rank_points)
 
         wp.xp += w_xp; wp.wins += 1; wp.total_matches += 1
-        wp.total_correct += winner.correct_answers
-        wp.total_questions += winner.correct_answers + winner.wrong_answers
-        wp.best_streak = max(wp.best_streak, winner.best_streak)
+        wp.total_correct += winner_correct
+        wp.total_questions += winner_correct + winner_wrong
+        wp.best_streak = max(wp.best_streak, winner_streak)
         wp.rank_points = max(0, wp.rank_points + w_rp)
         wp.rank_tier = calculate_rank_tier(wp.rank_points)
 
         lp.xp += l_xp; lp.losses += 1; lp.total_matches += 1
-        lp.total_correct += loser.correct_answers
-        lp.total_questions += loser.correct_answers + loser.wrong_answers
-        lp.best_streak = max(lp.best_streak, loser.best_streak)
+        lp.total_correct += loser_correct
+        lp.total_questions += loser_correct + loser_wrong
+        lp.best_streak = max(lp.best_streak, loser_streak)
         lp.rank_points = max(0, lp.rank_points + l_rp)
         lp.rank_tier = calculate_rank_tier(lp.rank_points)
 
-        winner.xp_earned = w_xp; winner.rank_points_delta = w_rp
-        loser.xp_earned = l_xp; loser.rank_points_delta = l_rp
-
         logger.info(
             f"Match {match_id} result — "
-            f"winner {winner.user_id}: +{w_xp}xp +{w_rp}rp | "
-            f"loser {loser.user_id}: +{l_xp}xp {l_rp}rp"
+            f"winner {winner_id}: +{w_xp}xp +{w_rp}rp | "
+            f"loser {loser_id}: +{l_xp}xp {l_rp}rp"
         )
     else:
         logger.warning(f"Match {match_id}: profiles not found — wp={wp} lp={lp}")
@@ -625,7 +658,7 @@ async def _handle_win_loss(match_id, winner, loser, now, db, redis):
     if match_res:
         match_res.status = MatchStatus.FINISHED
         match_res.finished_at = now
-        match_res.winner_id = winner.user_id
+        match_res.winner_id = winner_id
 
     try:
         await db.commit()
@@ -636,30 +669,30 @@ async def _handle_win_loss(match_id, winner, loser, now, db, redis):
         raise
 
     if wp:
-        await redis.zadd("leaderboard:global", {str(winner.user_id): wp.rank_points})
+        await redis.zadd("leaderboard:global", {str(winner_id): wp.rank_points})
     if lp:
-        await redis.zadd("leaderboard:global", {str(loser.user_id): lp.rank_points})
+        await redis.zadd("leaderboard:global", {str(loser_id): lp.rank_points})
 
     match_end_payload = {
-        "winner_id": str(winner.user_id),
+        "winner_id": str(winner_id),
         "is_draw": False,
         "forfeit": False,
         "players": [
             {
-                "user_id": str(winner.user_id),
-                "score": winner.score,
-                "correct_answers": winner.correct_answers,
-                "wrong_answers": winner.wrong_answers,
-                "best_streak": winner.best_streak,
+                "user_id": str(winner_id),
+                "score": winner_score,
+                "correct_answers": winner_correct,
+                "wrong_answers": winner_wrong,
+                "best_streak": winner_streak,
                 "xp_earned": w_xp,
                 "rank_points_delta": w_rp,
             },
             {
-                "user_id": str(loser.user_id),
-                "score": loser.score,
-                "correct_answers": loser.correct_answers,
-                "wrong_answers": loser.wrong_answers,
-                "best_streak": loser.best_streak,
+                "user_id": str(loser_id),
+                "score": loser_score,
+                "correct_answers": loser_correct,
+                "wrong_answers": loser_wrong,
+                "best_streak": loser_streak,
                 "xp_earned": l_xp,
                 "rank_points_delta": l_rp,
             },
