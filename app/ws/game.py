@@ -391,7 +391,10 @@ async def _advance_round(match_id, current_round, total_rounds, redis):
 
             next_round = current_round + 1
             if next_round > total_rounds:
-                await _finish_match(match_id, db, redis)
+                # Use a completely fresh session for _finish_match
+                # The current session already had commits and may be in a bad state
+                async with AsyncSessionLocal() as finish_db:
+                    await _finish_match(match_id, finish_db, redis)
                 return
 
             await redis.hset(RedisKeys.match_state(match_id), "current_round", str(next_round))
