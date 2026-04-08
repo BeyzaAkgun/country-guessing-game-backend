@@ -50,21 +50,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-# ```
-
-# ---
-
-# ### Empty `__init__.py` files needed
-# Create these as empty files:
-# ```
-# app/__init__.py
-# app/api/__init__.py
-# app/api/v1/__init__.py
-# app/api/v1/endpoints/__init__.py
-# app/core/__init__.py
-# app/db/__init__.py
-# app/models/__init__.py   ← not empty, use the one from Batch 3
-# app/schemas/__init__.py
-# app/services/__init__.py
-# app/ws/__init__.py
-# tests/__init__.py

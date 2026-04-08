@@ -4,6 +4,8 @@
 
 Built with FastAPI, PostgreSQL, and Redis. Powers real-time multiplayer matches, authentication, leaderboards, and XP/rank progression.
 
+**Live API:** Deployed on Fly.io (integrated with frontend at [country-guessing-game-five.vercel.app](https://country-guessing-game-five.vercel.app/))
+
 ## Tech Stack
 
 | Layer | Technology |
