@@ -1,3 +1,4 @@
+#country-guessing-game-backend/app/main.py
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,10 +41,13 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins_list,
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# If you want later, set ALLOWED_ORIGINS 
+# to your actual frontend origin(s) and remove the regex fallback for stricter security.
 
 # REST API routes
 app.include_router(api_router)

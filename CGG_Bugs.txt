@@ -1,0 +1,31 @@
+Bazı modlarda mobile ülke adı için text yazma yeri aşşağıda kalıyor kontrol et
+
+mobilde ülkeye basıp yazmak için text input a gidince ilk önce telefondan Autofill correct diye beyaz bir panel geliyor o gidiyor 
+yeniden ülkeye basıp text yazabiliyorsun ama ilk tıkladığında o geliyor ondan kurtul
+
+Ülke adlarını text olarak yazmayı kaldıralım seçilen ülkenin adını görüp seçme gelsin alttan ya da onaylama gibi ona bir bakalım daha
+kolay bir yol text yazmaktansa ya ülkeye tıklayıp submit ya da ülkeye tıklayıp seçim yapma
+
+
+Capital,flag,hint based game lerin tabu versiyonu
+
+
+modlarda skip and reveal ülke adını yayınlama pass sansı
+
+
+bazı infolarda hata.
+
+
+
+Leaderboard belki.
+
+
+
+
+
+
+
+
+
+
+ 

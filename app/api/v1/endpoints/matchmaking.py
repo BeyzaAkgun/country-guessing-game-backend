@@ -262,8 +262,8 @@
 
 
 
-#matchmaking.py
 # #matchmaking.py
+# #country-guessing-game-backend/app/api/v1/endpoints/matchmaking.py
 # from fastapi import APIRouter, Depends, HTTPException
 # from sqlalchemy.ext.asyncio import AsyncSession
 # from sqlalchemy import select
@@ -735,7 +735,7 @@
 #     }
 
 
-
+#country-guessing-game-backend/app/api/v1/endpoints/matchmaking.py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -847,6 +847,27 @@ async def _validate_match_found_key(user_id: str, db: AsyncSession, redis: aiore
         # Any error (bad UUID etc.) → clean up
         await redis.delete(_match_found_key(user_id))
         return None
+
+
+@router.get("/forfeit/pending", response_model=dict)
+async def get_pending_forfeit(
+    current_user: User = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    """Check if the user has an undelivered forfeit result from a match they left."""
+    user_id = str(current_user.id)
+    key = f"match:forfeit_pending:{user_id}"
+    raw = await redis.get(key)
+    if not raw:
+        return {"has_pending": False}
+    
+    await redis.delete(key)  # consume it — one-time delivery
+    data = json.loads(raw)
+    return {
+        "has_pending": True,
+        "match_id": data["match_id"],
+        "result": data["result"],
+    }
 
 
 @router.post("/queue", response_model=dict)
