@@ -139,6 +139,7 @@
 
 
 # ws.py
+#Below works good.
 from fastapi import APIRouter, WebSocket, Query
 from sqlalchemy import select
 from jose import JWTError

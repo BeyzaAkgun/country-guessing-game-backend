@@ -1,3 +1,4 @@
+#schemas/user.py
 from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
 from uuid import UUID
 from datetime import datetime
