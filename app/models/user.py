@@ -1,7 +1,7 @@
-#models/user.py
+# models/user.py
 import uuid
-from datetime import datetime, timezone
-from sqlalchemy import String, Boolean, DateTime, ForeignKey, Integer, Float, func
+from datetime import datetime, date, timezone
+from sqlalchemy import String, Boolean, DateTime, ForeignKey, Integer, Float, Date, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 from app.db.base import Base
@@ -47,6 +47,12 @@ class Profile(Base):
     avg_response_time_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    # ── NEW: daily challenge fields ───────────────────────────────────────────
+    daily_streak: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    best_daily_streak: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_daily_completion_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    perfect_daily_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="profile")
 

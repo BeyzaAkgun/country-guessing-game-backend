@@ -1,7 +1,7 @@
-#schemas/user.py
+# schemas/user.py
 from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, date as DateType
 
 
 class RegisterRequest(BaseModel):
@@ -57,6 +57,12 @@ class ProfileResponse(BaseModel):
     win_rate: float
     avg_response_time_ms: float
     avatar_url: str | None
+
+    # ── NEW: daily challenge fields ───────────────────────────────────────────
+    daily_streak: int = 0
+    best_daily_streak: int = 0
+    last_daily_completion_date: DateType | None = None
+    perfect_daily_count: int = 0
 
 
 class UserResponse(BaseModel):
